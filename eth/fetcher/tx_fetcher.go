@@ -39,15 +39,21 @@ const (
 	// can announce in a short time.
 	maxTxAnnounces = 4096
 
-	// maxTxRetrievals is the maximum transaction number can be fetched in one
-	// request. The rationale to pick 256 is:
-	//   - In eth protocol, the softResponseLimit is 2MB. Nowadays according to
-	//     Etherscan the average transaction size is around 200B, so in theory
-	//     we can include lots of transaction in a single protocol packet.
-	//   - However the maximum size of a single transaction is raised to 128KB,
-	//     so pick a middle value here to ensure we can maximize the efficiency
-	//     of the retrieval and response size overflow won't happen in most cases.
+	// maxTxRetrievals is the maximum number of transactions that can be fetched
+	// in one request. The rationale for picking 256 is to have a reasonabe lower
+	// bound for the transferred data (don't waste RTTs, transfer more meaningful
+	// batch sizes), but also have an upper bound on the sequentiality to allow
+	// using our entire peerset for deliveries.
+	//
+	// This number also acts as a failsafe against malicious announces which might
+	// cause us to request more data than we'd expect.
 	maxTxRetrievals = 256
+
+	// maxTxRetrievalSize is the max number of bytes that delivered transactions
+	// should weigh according to the announcements. The 128KB was chosen to limit
+	// retrieving a maximum of one blob transaction at a time to minimize hogging
+	// a connection between two peers.
+	maxTxRetrievalSize = 128 * 1024
 
 	// maxTxUnderpricedSetSize is the size of the underpriced transaction set that
 	// is used to track recent transactions that have been dropped so we don't
@@ -55,7 +61,7 @@ const (
 	maxTxUnderpricedSetSize = 32768
 
 	// maxTxUnderpricedTimeout is the max time a transaction should be stuck in the underpriced set.
-	maxTxUnderpricedTimeout = int64(5 * time.Minute)
+	maxTxUnderpricedTimeout = 5 * time.Minute
 
 	// txArriveTimeout is the time allowance before an announced transaction is
 	// explicitly requested.
@@ -100,6 +106,8 @@ var (
 	txFetcherFetchingPeers  = metrics.NewRegisteredGauge("eth/fetcher/transaction/fetching/peers", nil)
 	txFetcherFetchingHashes = metrics.NewRegisteredGauge("eth/fetcher/transaction/fetching/hashes", nil)
 )
+
+var errTerminated = errors.New("terminated")
 
 // txAnnounce is the notification of the availability of a batch
 // of new transactions in the network.
@@ -161,7 +169,7 @@ type TxFetcher struct {
 	drop    chan *txDrop
 	quit    chan struct{}
 
-	underpriced *lru.Cache[common.Hash, int64] // Transactions discarded as too cheap (don't re-fetch)
+	underpriced *lru.Cache[common.Hash, time.Time] // Transactions discarded as too cheap (don't re-fetch)
 
 	// Stage 1: Waiting lists for newly discovered transactions that might be
 	// broadcast without needing explicit request/reply round trips.
@@ -216,7 +224,7 @@ func NewTxFetcherForTests(
 		fetching:    make(map[common.Hash]string),
 		requests:    make(map[string]*txRequest),
 		alternates:  make(map[common.Hash]map[string]struct{}),
-		underpriced: lru.NewCache[common.Hash, int64](maxTxUnderpricedSetSize),
+		underpriced: lru.NewCache[common.Hash, time.Time](maxTxUnderpricedSetSize),
 		hasTx:       hasTx,
 		addTxs:      addTxs,
 		fetchTxs:    fetchTxs,
@@ -278,7 +286,7 @@ func (f *TxFetcher) Notify(peer string, types []byte, sizes []uint32, hashes []c
 // isKnownUnderpriced reports whether a transaction hash was recently found to be underpriced.
 func (f *TxFetcher) isKnownUnderpriced(hash common.Hash) bool {
 	prevTime, ok := f.underpriced.Peek(hash)
-	if ok && prevTime+maxTxUnderpricedTimeout < time.Now().Unix() {
+	if ok && prevTime.Before(time.Now().Add(-maxTxUnderpricedTimeout)) {
 		f.underpriced.Remove(hash)
 		return false
 	}
@@ -329,7 +337,7 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool) 
 			// Avoid re-request this transaction when we receive another
 			// announcement.
 			if errors.Is(err, txpool.ErrUnderpriced) || errors.Is(err, txpool.ErrReplaceUnderpriced) {
-				f.underpriced.Add(batch[j].Hash(), batch[j].Time().Unix())
+				f.underpriced.Add(batch[j].Hash(), batch[j].Time())
 			}
 			// Track a few interesting failure types
 			switch {
@@ -357,7 +365,7 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool) 
 		// If 'other reject' is >25% of the deliveries in any batch, sleep a bit.
 		if otherreject > 128/4 {
 			time.Sleep(200 * time.Millisecond)
-			log.Warn("Peer delivering stale transactions", "peer", peer, "rejected", otherreject)
+			log.Debug("Peer delivering stale transactions", "peer", peer, "rejected", otherreject)
 		}
 	}
 	select {
@@ -587,8 +595,9 @@ func (f *TxFetcher) loop() {
 								log.Warn("Announced transaction type mismatch", "peer", peer, "tx", hash, "type", delivery.metas[i].kind, "ann", meta.kind)
 								f.dropPeer(peer)
 							} else if delivery.metas[i].size != meta.size {
-								log.Warn("Announced transaction size mismatch", "peer", peer, "tx", hash, "size", delivery.metas[i].size, "ann", meta.size)
 								if math.Abs(float64(delivery.metas[i].size)-float64(meta.size)) > 8 {
+									log.Warn("Announced transaction size mismatch", "peer", peer, "tx", hash, "size", delivery.metas[i].size, "ann", meta.size)
+
 									// Normally we should drop a peer considering this is a protocol violation.
 									// However, due to the RLP vs consensus format messyness, allow a few bytes
 									// wiggle-room where we only warn, but don't drop.
@@ -612,8 +621,9 @@ func (f *TxFetcher) loop() {
 								log.Warn("Announced transaction type mismatch", "peer", peer, "tx", hash, "type", delivery.metas[i].kind, "ann", meta.kind)
 								f.dropPeer(peer)
 							} else if delivery.metas[i].size != meta.size {
-								log.Warn("Announced transaction size mismatch", "peer", peer, "tx", hash, "size", delivery.metas[i].size, "ann", meta.size)
 								if math.Abs(float64(delivery.metas[i].size)-float64(meta.size)) > 8 {
+									log.Warn("Announced transaction size mismatch", "peer", peer, "tx", hash, "size", delivery.metas[i].size, "ann", meta.size)
+
 									// Normally we should drop a peer considering this is a protocol violation.
 									// However, due to the RLP vs consensus format messyness, allow a few bytes
 									// wiggle-room where we only warn, but don't drop.
@@ -775,7 +785,7 @@ func (f *TxFetcher) loop() {
 // rescheduleWait iterates over all the transactions currently in the waitlist
 // and schedules the movement into the fetcher for the earliest.
 //
-// The method has a granularity of 'gatherSlack', since there's not much point in
+// The method has a granularity of 'txGatherSlack', since there's not much point in
 // spinning over all the transactions just to maybe find one that should trigger
 // a few ms earlier.
 func (f *TxFetcher) rescheduleWait(timer *mclock.Timer, trigger chan struct{}) {
@@ -788,7 +798,7 @@ func (f *TxFetcher) rescheduleWait(timer *mclock.Timer, trigger chan struct{}) {
 	for _, instance := range f.waittime {
 		if earliest > instance {
 			earliest = instance
-			if txArriveTimeout-time.Duration(now-earliest) < gatherSlack {
+			if txArriveTimeout-time.Duration(now-earliest) < txGatherSlack {
 				break
 			}
 		}
@@ -801,7 +811,7 @@ func (f *TxFetcher) rescheduleWait(timer *mclock.Timer, trigger chan struct{}) {
 // rescheduleTimeout iterates over all the transactions currently in flight and
 // schedules a cleanup run when the first would trigger.
 //
-// The method has a granularity of 'gatherSlack', since there's not much point in
+// The method has a granularity of 'txGatherSlack', since there's not much point in
 // spinning over all the transactions just to maybe find one that should trigger
 // a few ms earlier.
 //
@@ -826,7 +836,7 @@ func (f *TxFetcher) rescheduleTimeout(timer *mclock.Timer, trigger chan struct{}
 		}
 		if earliest > req.time {
 			earliest = req.time
-			if txFetchTimeout-time.Duration(now-earliest) < gatherSlack {
+			if txFetchTimeout-time.Duration(now-earliest) < txGatherSlack {
 				break
 			}
 		}
@@ -859,25 +869,36 @@ func (f *TxFetcher) scheduleFetches(timer *mclock.Timer, timeout chan struct{}, 
 		if len(f.announces[peer]) == 0 {
 			return // continue in the for-each
 		}
-		hashes := make([]common.Hash, 0, maxTxRetrievals)
-		f.forEachHash(f.announces[peer], func(hash common.Hash) bool {
-			if _, ok := f.fetching[hash]; !ok {
-				// Mark the hash as fetching and stash away possible alternates
-				f.fetching[hash] = peer
+		var (
+			hashes = make([]common.Hash, 0, maxTxRetrievals)
+			bytes  uint64
+		)
+		f.forEachAnnounce(f.announces[peer], func(hash common.Hash, meta *txMetadata) bool {
+			// If the transaction is already fetching, skip to the next one
+			if _, ok := f.fetching[hash]; ok {
+				return true
+			}
+			// Mark the hash as fetching and stash away possible alternates
+			f.fetching[hash] = peer
 
-				if _, ok := f.alternates[hash]; ok {
-					panic(fmt.Sprintf("alternate tracker already contains fetching item: %v", f.alternates[hash]))
-				}
-				f.alternates[hash] = f.announced[hash]
-				delete(f.announced, hash)
+			if _, ok := f.alternates[hash]; ok {
+				panic(fmt.Sprintf("alternate tracker already contains fetching item: %v", f.alternates[hash]))
+			}
+			f.alternates[hash] = f.announced[hash]
+			delete(f.announced, hash)
 
-				// Accumulate the hash and stop if the limit was reached
-				hashes = append(hashes, hash)
-				if len(hashes) >= maxTxRetrievals {
-					return false // break in the for-each
+			// Accumulate the hash and stop if the limit was reached
+			hashes = append(hashes, hash)
+			if len(hashes) >= maxTxRetrievals {
+				return false // break in the for-each
+			}
+			if meta != nil { // Only set eth/68 and upwards
+				bytes += uint64(meta.size)
+				if bytes >= maxTxRetrievalSize {
+					return false
 				}
 			}
-			return true // continue in the for-each
+			return true // scheduled, try to add more
 		})
 		// If any hashes were allocated, request them from the peer
 		if len(hashes) > 0 {
@@ -922,27 +943,28 @@ func (f *TxFetcher) forEachPeer(peers map[string]struct{}, do func(peer string))
 	}
 }
 
-// forEachHash does a range loop over a map of hashes in production, but during
-// testing it does a deterministic sorted random to allow reproducing issues.
-func (f *TxFetcher) forEachHash(hashes map[common.Hash]*txMetadata, do func(hash common.Hash) bool) {
+// forEachAnnounce does a range loop over a map of announcements in production,
+// but during testing it does a deterministic sorted random to allow reproducing
+// issues.
+func (f *TxFetcher) forEachAnnounce(announces map[common.Hash]*txMetadata, do func(hash common.Hash, meta *txMetadata) bool) {
 	// If we're running production, use whatever Go's map gives us
 	if f.rand == nil {
-		for hash := range hashes {
-			if !do(hash) {
+		for hash, meta := range announces {
+			if !do(hash, meta) {
 				return
 			}
 		}
 		return
 	}
 	// We're running the test suite, make iteration deterministic
-	list := make([]common.Hash, 0, len(hashes))
-	for hash := range hashes {
+	list := make([]common.Hash, 0, len(announces))
+	for hash := range announces {
 		list = append(list, hash)
 	}
 	sortHashes(list)
 	rotateHashes(list, f.rand.Intn(len(list)))
 	for _, hash := range list {
-		if !do(hash) {
+		if !do(hash, announces[hash]) {
 			return
 		}
 	}

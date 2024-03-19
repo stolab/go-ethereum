@@ -27,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 var (
@@ -185,7 +186,7 @@ func TestTransactionFetcherWaiting(t *testing.T) {
 // waitlist, and none of them are scheduled for retrieval until the wait expires.
 //
 // This test is an extended version of TestTransactionFetcherWaiting. It's mostly
-// to cover the metadata checkes without bloating up the basic behavioral tests
+// to cover the metadata checks without bloating up the basic behavioral tests
 // with all the useless extra fields.
 func TestTransactionFetcherWaitingWithMeta(t *testing.T) {
 	testTransactionFetcherParallel(t, txFetcherTest{
@@ -993,15 +994,14 @@ func TestTransactionFetcherTimeoutTimerResets(t *testing.T) {
 	})
 }
 
-// Tests that if thousands of transactions are announces, only a small
+// Tests that if thousands of transactions are announced, only a small
 // number of them will be requested at a time.
 func TestTransactionFetcherRateLimiting(t *testing.T) {
-	// Create a slew of transactions and to announce them
+	// Create a slew of transactions and announce them
 	var hashes []common.Hash
 	for i := 0; i < maxTxAnnounces; i++ {
 		hashes = append(hashes, common.Hash{byte(i / 256), byte(i % 256)})
 	}
-
 	testTransactionFetcherParallel(t, txFetcherTest{
 		init: func() *TxFetcher {
 			return NewTxFetcher(
@@ -1023,6 +1023,68 @@ func TestTransactionFetcherRateLimiting(t *testing.T) {
 				},
 				fetching: map[string][]common.Hash{
 					"A": hashes[1643 : 1643+maxTxRetrievals],
+				},
+			},
+		},
+	})
+}
+
+// Tests that if huge transactions are announced, only a small number of them will
+// be requested at a time, to keep the responses below a reasonable level.
+func TestTransactionFetcherBandwidthLimiting(t *testing.T) {
+	testTransactionFetcherParallel(t, txFetcherTest{
+		init: func() *TxFetcher {
+			return NewTxFetcher(
+				func(common.Hash) bool { return false },
+				nil,
+				func(string, []common.Hash) error { return nil },
+				nil,
+			)
+		},
+		steps: []interface{}{
+			// Announce mid size transactions from A to verify that multiple
+			// ones can be piled into a single request.
+			doTxNotify{peer: "A",
+				hashes: []common.Hash{{0x01}, {0x02}, {0x03}, {0x04}},
+				types:  []byte{types.LegacyTxType, types.LegacyTxType, types.LegacyTxType, types.LegacyTxType},
+				sizes:  []uint32{48 * 1024, 48 * 1024, 48 * 1024, 48 * 1024},
+			},
+			// Announce exactly on the limit transactions to see that only one
+			// gets requested
+			doTxNotify{peer: "B",
+				hashes: []common.Hash{{0x05}, {0x06}},
+				types:  []byte{types.LegacyTxType, types.LegacyTxType},
+				sizes:  []uint32{maxTxRetrievalSize, maxTxRetrievalSize},
+			},
+			// Announce oversized blob transactions to see that overflows are ok
+			doTxNotify{peer: "C",
+				hashes: []common.Hash{{0x07}, {0x08}},
+				types:  []byte{types.BlobTxType, types.BlobTxType},
+				sizes:  []uint32{params.MaxBlobGasPerBlock, params.MaxBlobGasPerBlock},
+			},
+			doWait{time: txArriveTimeout, step: true},
+			isWaiting(nil),
+			isScheduledWithMeta{
+				tracking: map[string][]announce{
+					"A": {
+						{common.Hash{0x01}, typeptr(types.LegacyTxType), sizeptr(48 * 1024)},
+						{common.Hash{0x02}, typeptr(types.LegacyTxType), sizeptr(48 * 1024)},
+						{common.Hash{0x03}, typeptr(types.LegacyTxType), sizeptr(48 * 1024)},
+						{common.Hash{0x04}, typeptr(types.LegacyTxType), sizeptr(48 * 1024)},
+					},
+					"B": {
+						{common.Hash{0x05}, typeptr(types.LegacyTxType), sizeptr(maxTxRetrievalSize)},
+						{common.Hash{0x06}, typeptr(types.LegacyTxType), sizeptr(maxTxRetrievalSize)},
+					},
+					"C": {
+						{common.Hash{0x07}, typeptr(types.BlobTxType), sizeptr(params.MaxBlobGasPerBlock)},
+						{common.Hash{0x08}, typeptr(types.BlobTxType), sizeptr(params.MaxBlobGasPerBlock)},
+					},
+				},
+				fetching: map[string][]common.Hash{
+					"A": {{0x02}, {0x03}, {0x04}},
+					"B": {{0x06}},
+					"C": {{0x08}},
 				},
 			},
 		},
@@ -1664,7 +1726,7 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 						if (meta == nil && (ann.kind != nil || ann.size != nil)) ||
 							(meta != nil && (ann.kind == nil || ann.size == nil)) ||
 							(meta != nil && (meta.kind != *ann.kind || meta.size != *ann.size)) {
-							t.Errorf("step %d, peer %s, hash %x: waitslot metadata mismatch: want %v, have %v/%v", i, peer, ann.hash, meta, ann.kind, ann.size)
+							t.Errorf("step %d, peer %s, hash %x: waitslot metadata mismatch: want %v, have %v/%v", i, peer, ann.hash, meta, *ann.kind, *ann.size)
 						}
 					}
 				}
@@ -1733,7 +1795,7 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 						if (meta == nil && (ann.kind != nil || ann.size != nil)) ||
 							(meta != nil && (ann.kind == nil || ann.size == nil)) ||
 							(meta != nil && (meta.kind != *ann.kind || meta.size != *ann.size)) {
-							t.Errorf("step %d, peer %s, hash %x: announce metadata mismatch: want %v, have %v/%v", i, peer, ann.hash, meta, ann.kind, ann.size)
+							t.Errorf("step %d, peer %s, hash %x: announce metadata mismatch: want %v, have %v/%v", i, peer, ann.hash, meta, *ann.kind, *ann.size)
 						}
 					}
 				}
@@ -1930,4 +1992,39 @@ func containsHash(slice []common.Hash, hash common.Hash) bool {
 		}
 	}
 	return false
+}
+
+// Tests that a transaction is forgotten after the timeout.
+func TestTransactionForgotten(t *testing.T) {
+	fetcher := NewTxFetcher(
+		func(common.Hash) bool { return false },
+		func(txs []*types.Transaction) []error {
+			errs := make([]error, len(txs))
+			for i := 0; i < len(errs); i++ {
+				errs[i] = txpool.ErrUnderpriced
+			}
+			return errs
+		},
+		func(string, []common.Hash) error { return nil },
+		func(string) {},
+	)
+	fetcher.Start()
+	defer fetcher.Stop()
+	// Create one TX which is 5 minutes old, and one which is recent
+	tx1 := types.NewTx(&types.LegacyTx{Nonce: 0})
+	tx1.SetTime(time.Now().Add(-maxTxUnderpricedTimeout - 1*time.Second))
+	tx2 := types.NewTx(&types.LegacyTx{Nonce: 1})
+
+	// Enqueue both in the fetcher. They will be immediately tagged as underpriced
+	if err := fetcher.Enqueue("asdf", []*types.Transaction{tx1, tx2}, false); err != nil {
+		t.Fatal(err)
+	}
+	// isKnownUnderpriced should trigger removal of the first tx (no longer be known underpriced)
+	if fetcher.isKnownUnderpriced(tx1.Hash()) {
+		t.Fatal("transaction should be forgotten by now")
+	}
+	// isKnownUnderpriced should not trigger removal of the second
+	if !fetcher.isKnownUnderpriced(tx2.Hash()) {
+		t.Fatal("transaction should be known underpriced")
+	}
 }
