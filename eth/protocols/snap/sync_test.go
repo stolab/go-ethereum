@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math/big"
 	mrand "math/rand"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +42,6 @@ import (
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 	"golang.org/x/crypto/sha3"
-	"golang.org/x/exp/slices"
 )
 
 func TestHashing(t *testing.T) {
@@ -64,7 +64,7 @@ func TestHashing(t *testing.T) {
 		}
 	}
 	var new = func() {
-		hasher := sha3.NewLegacyKeccak256().(crypto.KeccakState)
+		hasher := crypto.NewKeccakState()
 		var hash = make([]byte, 32)
 		for i := 0; i < len(bytecodes); i++ {
 			hasher.Reset()
@@ -96,7 +96,7 @@ func BenchmarkHashing(b *testing.B) {
 		}
 	}
 	var new = func() {
-		hasher := sha3.NewLegacyKeccak256().(crypto.KeccakState)
+		hasher := crypto.NewKeccakState()
 		var hash = make([]byte, 32)
 		for i := 0; i < len(bytecodes); i++ {
 			hasher.Reset()
@@ -839,7 +839,7 @@ func testMultiSyncManyUseless(t *testing.T, scheme string) {
 	verifyTrie(scheme, syncer.db, sourceAccountTrie.Hash(), t)
 }
 
-// TestMultiSyncManyUseless contains one good peer, and many which doesn't return anything valuable at all
+// TestMultiSyncManyUselessWithLowTimeout contains one good peer, and many which doesn't return anything valuable at all
 func TestMultiSyncManyUselessWithLowTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -1378,7 +1378,7 @@ func testSyncWithStorageAndNonProvingPeer(t *testing.T, scheme string) {
 	verifyTrie(scheme, syncer.db, sourceAccountTrie.Hash(), t)
 }
 
-// TestSyncWithStorage tests  basic sync using accounts + storage + code, against
+// TestSyncWithStorageMisbehavingProve tests  basic sync using accounts + storage + code, against
 // a peer who insists on delivering full storage sets _and_ proofs. This triggered
 // an error, where the recipient erroneously clipped the boundary nodes, but
 // did not mark the account for healing.
@@ -1873,8 +1873,9 @@ func verifyTrie(scheme string, db ethdb.KeyValueStore, root common.Hash, t *test
 // TestSyncAccountPerformance tests how efficient the snap algo is at minimizing
 // state healing
 func TestSyncAccountPerformance(t *testing.T) {
-	t.Parallel()
-
+	// These tests must not run in parallel: they modify the
+	// global var accountConcurrency
+	// t.Parallel()
 	testSyncAccountPerformance(t, rawdb.HashScheme)
 	testSyncAccountPerformance(t, rawdb.PathScheme)
 }

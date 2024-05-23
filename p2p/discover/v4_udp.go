@@ -142,7 +142,7 @@ func ListenV4(c UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv4, error) {
 		log:             cfg.Log,
 	}
 
-	tab, err := newMeteredTable(t, ln.Database(), cfg)
+	tab, err := newTable(t, ln.Database(), cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -375,6 +375,10 @@ func (t *UDPv4) RequestENR(n *enode.Node) (*enode.Node, error) {
 	return respN, nil
 }
 
+func (t *UDPv4) TableBuckets() [][]BucketNode {
+	return t.tab.Nodes()
+}
+
 // pending adds a reply matcher to the pending reply queue.
 // see the documentation of type replyMatcher for a detailed explanation.
 func (t *UDPv4) pending(id enode.ID, ip net.IP, ptype byte, callback replyMatchFunc) *replyMatcher {
@@ -548,7 +552,7 @@ func (t *UDPv4) handlePacket(from *net.UDPAddr, buf []byte) error {
 	}
 	packet := t.wrapPacket(rawpacket)
 	fromID := fromKey.ID()
-	if err == nil && packet.preverify != nil {
+	if packet.preverify != nil {
 		err = packet.preverify(packet, from, fromID, fromKey)
 	}
 	t.log.Trace("<< "+packet.Name(), "id", fromID, "addr", from, "err", err)
@@ -669,10 +673,10 @@ func (t *UDPv4) handlePing(h *packetHandlerV4, from *net.UDPAddr, fromID enode.I
 	n := wrapNode(enode.NewV4(h.senderKey, from.IP, int(req.From.TCP), from.Port))
 	if time.Since(t.db.LastPongReceived(n.ID(), from.IP)) > bondExpiration {
 		t.sendPing(fromID, from, func() {
-			t.tab.addVerifiedNode(n)
+			t.tab.addInboundNode(n)
 		})
 	} else {
-		t.tab.addVerifiedNode(n)
+		t.tab.addInboundNode(n)
 	}
 
 	// Update node database and endpoint predictor.
